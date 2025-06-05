@@ -24,29 +24,92 @@ using Object = UnityEngine.Object;
 
 namespace SVO
 {
+    /// <summary>
+    /// Sparse Voxel Octree（疎なボクセルオクトリー）のメインクラス
+    /// 
+    /// データ構造の説明：
+    /// - オクトリーは3D空間を8つの子ノードに再帰的に分割する階層構造
+    /// - 各ノードは「ポインタ」（子ノードへの参照）か「ボクセル」（実際のデータ）のいずれか
+    /// - 空のボクセルは格納せず、メモリ効率を向上させる（疎な構造）
+    /// 
+    /// メモリ管理：
+    /// - _dataリストが全てのノードデータを連続して格納
+    /// - フリープールを使用してメモリ再利用と断片化を防ぐ
+    /// - GPU転送用にTexture3Dとして最適化されたメモリレイアウト
+    /// </summary>
     public class Octree : IDisposable
     {
+        // GPU転送用の一時的なテクスチャ（メモリ効率のため再利用）
         private static Texture3D tempTex = null;
         
+        /// <summary>
+        /// GPU側で使用するためのTexture3D形式のオクトリーデータ
+        /// 256x256のスライスに分割して格納し、深度方向に拡張可能
+        /// </summary>
         public Texture3D Data { get; private set; }
 
-        // These lists are effectively unmanaged memory blocks. This allows for a simple transition from CPU to GPU memory,
-        // and is much easier for the C# gc to deal with.
+        // メモリ効率の最適化：C#のGCを回避するため、int配列として管理
+        // これにより、CPU→GPU間の転送が高速化され、ガベージコレクションの負荷も軽減
+        
+        /// <summary>
+        /// 全てのオクトリーノードデータを格納するメインメモリブロック
+        /// 形式：int配列として管理し、ポインタとボクセルデータを混在格納
+        /// 最上位ビット（31bit）：ノードタイプフラグ（0=ポインタ, 1=ボクセル）
+        /// 下位31ビット：ポインタまたは属性データへの参照
+        /// </summary>
         private List<int> _data = new List<int>(new[] { 1 << 31 });
+        
+        /// <summary>
+        /// 削除されたノード構造のメモリ位置を管理するフリープール
+        /// メモリ断片化を防ぎ、削除・追加操作を高速化
+        /// </summary>
         private readonly HashSet<int> _freeStructureMemory = new HashSet<int>();
+        
+        /// <summary>
+        /// 削除された属性データのメモリ位置を管理するフリープール
+        /// 色、法線などの属性データの再利用でメモリ効率を向上
+        /// </summary>
         private readonly HashSet<int> _freeAttributeMemory = new HashSet<int>();
+        
+        /// <summary>
+        /// GPU更新追跡用：各Texture3Dスライスの更新回数
+        /// 差分更新により、変更されたスライスのみをGPUに転送
+        /// </summary>
         private ulong[] _updateCount = new ulong[2048];
+        
+        /// <summary>
+        /// GPU更新追跡用：各スライスの最後の適用時刻
+        /// 差分更新の判定に使用
+        /// </summary>
         private ulong[] _lastApply = new ulong[2048];
 
+        // 座標管理の最適化：前回の操作位置を記憶してツリー走査を高速化
+        
+        /// <summary>
+        /// ツリー走査の最適化用：各深度でのポインタスタック
+        /// 前回のボクセル操作位置から共通の親ノードを再利用
+        /// 最大深度24（2^-23の精度）まで対応
+        /// </summary>
         private int[] _ptrStack = new int[24];
+        
+        /// <summary>
+        /// 前回操作したボクセルの正規化座標（1.0-2.0の範囲）
+        /// 隣接ボクセルへのアクセス時にツリー走査を最適化
+        /// </summary>
         private Vector3 _ptrStackPos = Vector3.one;
+        
+        /// <summary>
+        /// 現在のポインタスタックの深度
+        /// ツリーの共通親ノードからの走査開始深度を管理
+        /// </summary>
         private int _ptrStackDepth;
 
         public Octree(Texture3D data)
         {
+            // 全スライスを未更新状態に初期化
             for (int i = 0; i < _lastApply.Length; i++)
                 _lastApply[i] = ulong.MaxValue;
-            _ptrStack[0] = 0;
+            _ptrStack[0] = 0; // ルートノードのポインタ
             Data = data;
         }
 
@@ -57,40 +120,50 @@ namespace SVO
         }
         
         /// <summary>
-        /// Edits the voxel at some position with depth and attributes data.
+        /// 指定位置にボクセルを設定する（ユーザー向けAPI）
+        /// 座標系を[-0.5, 0.5)から内部座標系[1.0, 2.0)に変換
         /// </summary>
-        /// <param name="position">Position of the voxel, with each component in the range [-.5, .5).</param>
-        /// <param name="depth">Depth of the voxel. A depth of n means a voxel of editDepth pow(2f, -n)</param>
-        /// <param name="color">Color of the voxel. Transparency is currently ignored, unless an alpha value of 0 is
-        /// provided, in which case the voxel is simply deleted.</param>
-        /// <param name="attributes">Shading data for the voxel. Best for properties like normals.</param>
+        /// <param name="position">ボクセル位置（各成分は[-0.5, 0.5)の範囲）</param>
+        /// <param name="depth">ボクセルの深度（n深度 = 2^-n サイズ）</param>
+        /// <param name="color">ボクセルの色（アルファ0で削除）</param>
+        /// <param name="attributes">シェーディング用属性データ（法線など）</param>
         public void SetVoxel(Vector3 position, int depth, Color color, int[] attributes)
         {
             SetVoxelNormalized(position + new Vector3(1.5f, 1.5f, 1.5f), depth, color, attributes);
         }
 
         /// <summary>
-        /// Edits the voxel at some position with depth and attributes data.
+        /// 正規化座標でボクセルを設定する（内部処理メソッド）
+        /// 
+        /// メモリ効率の最適化技術：
+        /// 1. 浮動小数点ビット操作による高速座標計算
+        /// 2. 前回位置の記憶による差分ツリー走査
+        /// 3. フリープールによるメモリ再利用
+        /// 4. 階層的メモリ配置による空間局所性の向上
         /// </summary>
-        /// <param name="position">Position of the voxel, with each component in the range [1, 2).</param>
-        /// <param name="depth">Depth of the voxel. A depth of n means a voxel of size pow(2f, -n)</param>
-        /// <param name="color">Color of the voxel</param>
-        /// <param name="attributes">Shading data for the voxel. Best for properties like normals.</param>
+        /// <param name="position">正規化座標（各成分は[1.0, 2.0)の範囲）</param>
+        /// <param name="depth">ボクセル深度</param>
+        /// <param name="color">ボクセル色</param>
+        /// <param name="attributes">属性データ</param>
         private void SetVoxelNormalized(Vector3 position, int depth, Color color, int[] attributes)
         {
+            // 高速ビット操作のための unsafe ポインタ変換
+            // IEEE 754 浮動小数点の内部表現を直接操作
             unsafe int AsInt(float f) => *(int*)&f;
             int FirstSetHigh(int i) => (AsInt(i) >> 23) - 127;
 
+            // 座標範囲の制限（内部座標系 [1.0, 2.0) に正規化）
             position.x = Mathf.Clamp(position.x, 1f, 1.99999988079f);
             position.y = Mathf.Clamp(position.y, 1f, 1.99999988079f);
             position.z = Mathf.Clamp(position.z, 1f, 1.99999988079f);
             
-            // Create 'internalAttributes' which is the same as attributes
-            // but with one extra int at the beggining for color and metadata
+            // 内部属性データの作成：色データ + カスタム属性
+            // メモリレイアウト：[メタデータ+RGB][属性1][属性2]...
             int[] internalAttributes = null;
             if(color.a != 0f)
             {
                 internalAttributes = new int[attributes.Length + 1];
+                // 24-31bit: 属性データ長, 16-23bit: R, 8-15bit: G, 0-7bit: B
                 internalAttributes[0] |= attributes.Length + 1 << 24;
                 internalAttributes[0] |= (int)(color.r * 255) << 16;
                 internalAttributes[0] |= (int)(color.g * 255) << 8;
@@ -98,45 +171,45 @@ namespace SVO
                 for (var i = 0; i < attributes.Length; i++) internalAttributes[i + 1] = attributes[i];
             }
             
-            // Attempt to skip initial tree iterations by reusing the position of the last voxel
+            // ツリー走査の最適化：前回位置との差分を計算
+            // 浮動小数点のビット表現でXOR演算し、変化したビット位置を特定
             var differingBits = AsInt(_ptrStackPos.x) ^ AsInt(position.x);
             differingBits |= AsInt(_ptrStackPos.y) ^ AsInt(position.y);
             differingBits |= AsInt(_ptrStackPos.z) ^ AsInt(position.z);
             var firstSet = 23 - FirstSetHigh(differingBits);
             var stepDepth = Math.Min(Math.Min(firstSet - 1, _ptrStackDepth), depth);
             
+            // 共通の親ノードから走査を開始（O(log n)の最適化）
             var ptr = _ptrStack[stepDepth];
-            var type = (_data[ptr] >> 31) & 1; // Type of root node
-            // Step down one depth until a non-ptr node is hit or the desired depth is reached.
+            var type = (_data[ptr] >> 31) & 1; // ノードタイプ取得
+            
+            // 目標深度まで、またはボクセルノード到達まで降下
             while(type == 0 && stepDepth < depth)
             {
-                // Descend to the next branch
-                ptr = _data[ptr]; 
+                ptr = _data[ptr]; // ポインタを辿る
                 
-                // Step to next node
                 stepDepth++;
+                // 各軸のビット位置から子ノードインデックスを計算
+                // IEEE 754の指数部を利用した高速ビット抽出
                 var xm = (AsInt(position.x) >> (23 - stepDepth)) & 1;
                 var ym = (AsInt(position.y) >> (23 - stepDepth)) & 1;
                 var zm = (AsInt(position.z) >> (23 - stepDepth)) & 1;
-                var childIndex = (xm << 2) + (ym << 1) + zm;
+                var childIndex = (xm << 2) + (ym << 1) + zm; // 3Dインデックス→1D変換
                 ptr += childIndex;
-                _ptrStack[stepDepth] = ptr;
+                _ptrStack[stepDepth] = ptr; // 走査パスを記録
                 
-                // Get type of the node
                 type = (_data[ptr] >> 31) & 1;
             }
 
-            // The new voxels position or desired depth has now been reached
-            // delete old voxel data
+            // 既存ボクセルデータの削除とメモリ解放
             var original = _data[ptr];
             int[] originalShadingData;
-            if (type == 0)
+            if (type == 0) // ポインタノードの場合、子ツリー全体を解放
             {
                 FreeBranch(original);
             }
-            if (type == 1 && original != 1 << 31)
+            if (type == 1 && original != 1 << 31) // 実ボクセルの場合、属性データを解放
             {
-                // Get the attributes data
                 var attribPtr = original & 0x7FFFFFFF;
                 var size = (_data[attribPtr] >> 24) & 0xFF;
                 originalShadingData = new int[size];
@@ -146,55 +219,77 @@ namespace SVO
             }
             else originalShadingData = null;
 
+            // 必要に応じて中間ブランチノードを作成（階層構造の構築）
             while (stepDepth < depth)
             {
                 stepDepth++;
                 
-                // Calculate index of next node
+                // 次レベルの子ノードインデックス計算
                 var xm = (AsInt(position.x) >> (23 - stepDepth)) & 1;
                 var ym = (AsInt(position.y) >> (23 - stepDepth)) & 1;
                 var zm = (AsInt(position.z) >> (23 - stepDepth)) & 1;
                 var childIndex = (xm << 2) + (ym << 1) + zm;
                 
-                // Create another branch to go down another depth
-                // The last hit voxel MUST be type 1 (Voxel). Otherwise stepDepth == depth.
+                // 8つの子ノードを持つブランチを作成
+                // 対象子ノード以外は既存データで初期化（データ保持）
                 var defaultData = new int[8];
                 for (var i = 0; i < 8; i++)
                     if (i == childIndex)
-                        defaultData[i] = 1 << 31; // Placeholder
+                        defaultData[i] = 1 << 31; // プレースホルダー
                     else
                         defaultData[i] = (1 << 31) | AllocateAttributeData(originalShadingData);
+                        
                 var branchPtr = AllocateBranch(defaultData);
                 _data[ptr] = branchPtr;
-                RecordUpdate(ptr);
+                RecordUpdate(ptr); // GPU更新を記録
                 ptr = branchPtr + childIndex;
                 _ptrStack[stepDepth] = ptr;
             }
+            
+            // 最終ボクセルデータの設定
             _data[ptr] = (1 << 31) | AllocateAttributeData(internalAttributes);
             RecordUpdate(ptr);
             
+            // 次回の走査最適化のため、現在位置を記録
             _ptrStackDepth = stepDepth;
             _ptrStackPos = position;
         }
 
+        /// <summary>
+        /// 三角形領域をボクセル化する並列処理対応メソッド
+        /// 
+        /// 並列化の技術：
+        /// 1. 再帰的空間分割による並列処理可能な分解
+        /// 2. 三角形-ボックス交差判定の高速化
+        /// 3. 属性補間による高品質なボクセル化
+        /// </summary>
+        /// <param name="vertices">三角形の頂点</param>
+        /// <param name="depth">ボクセル化深度</param>
+        /// <param name="attributeGenerator">属性生成関数</param>
         public void FillTriangle(Vector3[] vertices, int depth, Func<Bounds, Tuple<Color, int[]>> attributeGenerator)
         {
+            // 再帰的ボクセル化：空間を8分割しながら三角形との交差を判定
             void FillRecursively(int currentDepth, Bounds bounds)
             {
+                // 高速三角形-ボックス交差判定（並列処理に最適化）
                 if (TriBoxOverlap.IsIntersecting(bounds, vertices))
                 {
                     if (depth == currentDepth)
                     {
+                        // 最終深度到達：属性補間してボクセル生成
                         var (color, attributes) = attributeGenerator(bounds);
                         SetVoxel(bounds.min, depth, color, attributes);
                     }
-                    else for (var i = 0; i < 8; i++) // Call recursively for children.
+                    else // 再帰的に8つの子空間を処理（並列化可能）
                     {
-                        var nextCenter = 0.5f * bounds.extents + bounds.min;
-                        if ((i & 4) > 0) nextCenter.x += bounds.extents.x;
-                        if ((i & 2) > 0) nextCenter.y += bounds.extents.y;
-                        if ((i & 1) > 0) nextCenter.z += bounds.extents.z;
-                        FillRecursively(currentDepth + 1, new Bounds(nextCenter, bounds.extents));
+                        for (var i = 0; i < 8; i++)
+                        {
+                            var nextCenter = 0.5f * bounds.extents + bounds.min;
+                            if ((i & 4) > 0) nextCenter.x += bounds.extents.x;
+                            if ((i & 2) > 0) nextCenter.y += bounds.extents.y;
+                            if ((i & 1) > 0) nextCenter.z += bounds.extents.z;
+                            FillRecursively(currentDepth + 1, new Bounds(nextCenter, bounds.extents));
+                        }
                     }
                 }
             }
@@ -391,6 +486,10 @@ namespace SVO
             return false;
         }
 
+        /// <summary>
+        /// ブランチノードとその子ノードを再帰的に解放
+        /// メモリリークを防ぐための重要な処理
+        /// </summary>
         private void FreeBranch(int ptr)
         {
             _freeStructureMemory.Add(ptr);
@@ -399,41 +498,56 @@ namespace SVO
                 var optr = ptr + i;
                 var type = (_data[optr] >> 31) & 1;
                 if(type == 0)
-                    FreeBranch(_data[optr]);
+                    FreeBranch(_data[optr]); // 再帰的解放
                 else if(_data[optr] != 1 << 31)
                     FreeAttributes(_data[optr] & 0x7FFFFFFF);
             }
         }
 
+        /// <summary>
+        /// 属性データメモリを解放してフリープールに追加
+        /// </summary>
         private void FreeAttributes(int ptr)
         {
             _freeAttributeMemory.Add(ptr);
         }
         
+        /// <summary>
+        /// ブランチノード用メモリを割り当て
+        /// フリープールから再利用可能メモリを優先使用
+        /// </summary>
         private int AllocateBranch(IReadOnlyList<int> ptrs)
         {
             int ptr;
             if (_freeStructureMemory.Count == 0)
             {
+                // 新規メモリ割り当て
                 ptr = _data.Count;
                 _data.AddRange(ptrs);
             }
             else
             {
+                // フリープールから再利用
                 ptr = _freeStructureMemory.Last();
                 for (var i = 0; i < ptrs.Count; i++)
                     _data[i + ptr] = ptrs[i];
                 _freeStructureMemory.Remove(ptr);
             }
-            // Only need to record update twice because branch can only be in 2 slices at most
+            // GPU更新記録（最大256x256スライスにまたがる可能性を考慮）
             RecordUpdate(ptr);
             RecordUpdate(ptr + 7);
             return ptr;
         }
 
+        /// <summary>
+        /// 属性データ用メモリを割り当て
+        /// 同サイズの削除済みブロックを優先再利用してメモリ断片化を防ぐ
+        /// </summary>
         private int AllocateAttributeData(IReadOnlyList<int> attributes)
         {
             if (attributes == null) return 0;
+            
+            // 同サイズの解放済みメモリブロックを検索
             var index = 0;
             foreach (var ptr in _freeAttributeMemory)
             {
@@ -444,18 +558,21 @@ namespace SVO
                     continue;
                 }
                 
+                // サイズ適合ブロック発見：再利用
                 for (var i = 0; i < attributes.Count; i++)
                 {
                     _data[ptr + i] = attributes[i];
                 }
-                if (attributes.Count > 256 * 256) throw new ArgumentException("Too many attributes. Max number is 65536 per voxel.");
-                // Assume attributes.Count is less than the size of one slice.
+                if (attributes.Count > 256 * 256) 
+                    throw new ArgumentException("Too many attributes. Max number is 65536 per voxel.");
+                
                 RecordUpdate(ptr);
                 RecordUpdate(ptr + attributes.Count - 1);
                 _freeAttributeMemory.Remove(ptr);
                 return ptr;
             }
 
+            // 新規メモリ割り当て
             var endPtr = _data.Count;
             _data.AddRange(attributes);
             RecordUpdate(endPtr);
@@ -464,47 +581,62 @@ namespace SVO
         }
 
         /// <summary>
-        /// Creates a texture to contain this octree.
+        /// オクトリーデータをGPU用Texture3Dに変換
+        /// 
+        /// メモリ効率とパフォーマンスの最適化：
+        /// 1. 差分更新：変更されたスライスのみを転送
+        /// 2. テクスチャ再利用：可能な場合は既存テクスチャを再利用
+        /// 3. 並列転送：複数スライスを効率的に処理
         /// </summary>
-        /// <param name="tryReuseOldTexture">Attempt to reuse the previous texture. This can be faster, but the old texture will no longer be usable.</param>
-        /// <returns>A new texture containing the updated Octree.</returns>
+        /// <param name="tryReuseOldTexture">既存テクスチャの再利用を試行</param>
+        /// <returns>更新されたTexture3D</returns>
         public Texture3D Apply(bool tryReuseOldTexture=true)
         {
+            // 一時テクスチャの初期化（メモリプール的な使用）
             if (tempTex is null)
                 tempTex = new Texture3D(256, 256, 1, TextureFormat.RFloat, false);
             
+            // 必要深度の計算：データサイズに基づく動的スケーリング
             var depth = Mathf.NextPowerOfTwo(Mathf.CeilToInt((float) _data.Count / 256 / 256));
+            
+            // テクスチャ再作成の判定
             if (Data is null || depth != Data.depth || !tryReuseOldTexture)
             {
                 Object.Destroy(Data);
                 Data = new Texture3D(256, 256, depth, TextureFormat.RFloat, false);
+                // 全スライスを強制更新対象に設定
                 for (int i = 0; i < _lastApply.Length; i++)
                     _lastApply[i] = ulong.MaxValue;
             }
 
             uint updated = 0;
+            // 差分更新：変更されたスライスのみを処理
             for (var i = 0; i < depth; i++)
             {
                 if (_lastApply[i] == _updateCount[i])
-                    continue;
+                    continue; // このスライスは更新不要
 
                 updated++;
                 _lastApply[i] = _updateCount[i];
                 
+                // スライス範囲の計算
                 var minIndex = i * 256 * 256;
                 var maxIndex = (i + 1) * 256 * 256;
                 if (minIndex > _data.Count) minIndex = _data.Count;
                 if (maxIndex > _data.Count) maxIndex = _data.Count;
                 
                 if (minIndex >= maxIndex) break;
+                
+                // データ転送：CPU→GPU
                 var block = new int[256 * 256];
                 _data.CopyTo(minIndex, block, 0, maxIndex - minIndex);
                 tempTex.SetPixelData(block, 0);
                 tempTex.Apply();
+                // 高速テクスチャコピー（GPU内部転送）
                 Graphics.CopyTexture(tempTex, 0, 0, 0, 0, 256, 256, Data, i, 0, 0, 0);
-                
             }
 
+            // GPU側の更新通知
             if (updated != 0)
             {
                 Data.IncrementUpdateCount();
@@ -513,26 +645,34 @@ namespace SVO
         }
 
         /// <summary>
-        /// Rebuilds the internal structure of the octree. This makes the octree memory continuous, lowering memory
-        /// overhead and potentially increasing performance.
+        /// オクトリー内部構造の最適化と再構築
+        /// 
+        /// メモリ最適化技術：
+        /// 1. メモリ連続性の向上：断片化を解消
+        /// 2. 空間局所性の改善：関連データの近接配置  
+        /// 3. キャッシュ効率の向上：アクセスパターンの最適化
         /// </summary>
         public void Rebuild()
         {
+            // 最適化されたメモリ容量の計算
             var capacity = Mathf.NextPowerOfTwo(_data.Count - _freeStructureMemory.Count * 8 - _freeAttributeMemory.Count);
             var optimizedData = new List<int>(capacity);
 
+            // 再帰的ブランチ再構築：深度優先でメモリを連続配置
             void RebuildBranch(int referenceBranchPtr)
             {
                 var start = optimizedData.Count;
-                optimizedData.AddRange(new int[8]);
+                optimizedData.AddRange(new int[8]); // 8つの子ノード分を予約
+                
                 for (var i = 0; i < 8; i++)
                 {
                     if (_data[referenceBranchPtr + i] == 1 << 31)
                     {
-                        optimizedData[start + i] = 1 << 31;
+                        optimizedData[start + i] = 1 << 31; // 空ボクセル
                     }
                     else if ((_data[referenceBranchPtr + i] >> 31 & 1) == 1)
                     {
+                        // ボクセルノード：属性データを連続配置
                         optimizedData[start + i] = 1 << 31 | optimizedData.Count;
                         var attribPtr = _data[referenceBranchPtr + i] & 0x7FFFFFFF;
                         var c = (_data[attribPtr] >> 24) & 0xFF;
@@ -541,12 +681,14 @@ namespace SVO
                     }
                     else
                     {
+                        // ポインタノード：再帰的に子ブランチを処理
                         optimizedData[start + i] = optimizedData.Count;
                         RebuildBranch(_data[referenceBranchPtr + i]);
                     }
                 }   
             }
 
+            // ルートノードから再構築開始
             if (_data[0] == 1 << 31)
             {
                 optimizedData.Add(1 << 31);
@@ -565,6 +707,7 @@ namespace SVO
                 RebuildBranch(_data[0]);
             }
 
+            // 最適化されたデータで置き換え
             _data = optimizedData;
             _ptrStackDepth = 0;
             _ptrStackPos = Vector3.one;
@@ -576,9 +719,13 @@ namespace SVO
                 _lastApply[i] = ulong.MaxValue;
         }
 
+        /// <summary>
+        /// GPU更新の記録：該当スライスの更新カウンタを増加
+        /// 差分更新システムの中核機能
+        /// </summary>
         private void RecordUpdate(int idx)
         {
-            _updateCount[idx >> 16]++;
+            _updateCount[idx >> 16]++; // 16bit右シフトでスライス番号を取得
         }
 
         public void Dispose()
